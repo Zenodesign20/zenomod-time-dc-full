@@ -11,13 +11,17 @@ import glob
 from pydrive2.auth import ServiceAccountCredentials
 from pydrive2.drive import GoogleDrive
 
+# ================= ENV =================
+
 TOKEN = os.getenv("DISCORD_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN not found in Railway Variables")
 
 DATA_FILE = "members.json"
 BACKUP_FILE = "members_backup.json"
 
-# Google Drive
 FOLDER_ID = "1sPQUdBZce1Os4oRPkDWFqsgzgkp95cha"
 
 LOGO = "https://cdn.discordapp.com/attachments/1468621028598087843/1481027347124719707/member.png"
@@ -60,23 +64,28 @@ DATA = load_data()
 
 def upload_to_drive(file_name):
 
-    scope = ["https://www.googleapis.com/auth/drive"]
+    try:
 
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        "drive_key.json", scope
-    )
+        scope = ["https://www.googleapis.com/auth/drive"]
 
-    drive = GoogleDrive(creds)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            "drive_key.json", scope
+        )
 
-    file_drive = drive.CreateFile({
-        "title": file_name,
-        "parents": [{"id": FOLDER_ID}]
-    })
+        drive = GoogleDrive(creds)
 
-    file_drive.SetContentFile(file_name)
-    file_drive.Upload()
+        file_drive = drive.CreateFile({
+            "title": file_name,
+            "parents": [{"id": FOLDER_ID}]
+        })
 
-    print("Uploaded to Google Drive:", file_name)
+        file_drive.SetContentFile(file_name)
+        file_drive.Upload()
+
+        print("Uploaded to Google Drive:", file_name)
+
+    except Exception as e:
+        print("Drive upload error:", e)
 
 # ================= QUEUE =================
 
@@ -86,6 +95,7 @@ queue = asyncio.Queue()
 async def queue_worker():
 
     if queue.empty():
+        await asyncio.sleep(1)
         return
 
     task = await queue.get()
@@ -141,6 +151,8 @@ def build_embed(member, info):
 # ================= DM =================
 
 async def dm_user(member, text):
+    if not member:
+        return
     try:
         await member.send(text)
     except:
@@ -186,6 +198,10 @@ class CancelView(discord.ui.View):
 
         member = interaction.guild.get_member(int(member_id))
         role = interaction.guild.get_role(info["role_id"])
+
+        if not member or not role:
+            await interaction.response.send_message("❌ ไม่พบ member หรือ role")
+            return
 
         await queue.put({
             "type": "remove_role",
@@ -239,44 +255,7 @@ async def setrole(interaction: discord.Interaction, member: discord.Member, role
     DATA[str(member.id)] = info
     save_data(DATA)
 
-# ================= SYNC =================
-
-@bot.tree.command(name="syncmembers")
-
-async def syncmembers(interaction: discord.Interaction):
-
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ admin only", ephemeral=True)
-        return
-
-    synced = 0
-
-    for uid, info in DATA.items():
-
-        channel = bot.get_channel(info["channel_id"])
-
-        if not channel:
-            continue
-
-        try:
-            msg = await channel.fetch_message(info["message_id"])
-        except:
-            continue
-
-        member = interaction.guild.get_member(int(uid))
-
-        if not member:
-            continue
-
-        embed = build_embed(member, info)
-
-        await msg.edit(embed=embed, view=CancelView())
-
-        synced += 1
-
-    await interaction.response.send_message(f"✅ ซิงค์ {synced} คนแล้ว")
-
-# ================= CHECK EXPIRE =================
+# ================= EXPIRE CHECK =================
 
 @tasks.loop(minutes=10)
 
@@ -295,6 +274,9 @@ async def check_expire():
 
         member = guild.get_member(int(uid))
         role = guild.get_role(info["role_id"])
+
+        if not member or not role:
+            continue
 
         expire = date.fromisoformat(info["expire_date"])
         expire_dt = datetime.combine(expire, datetime.max.time(), tzinfo=timezone.utc)
@@ -323,7 +305,7 @@ async def check_expire():
     if changed:
         save_data(DATA)
 
-# ================= AUTO BACKUP =================
+# ================= BACKUP =================
 
 @tasks.loop(hours=6)
 
