@@ -6,113 +6,68 @@ import json
 import os
 import shutil
 import asyncio
-import glob
-
-from pydrive2.auth import ServiceAccountCredentials
-from pydrive2.drive import GoogleDrive
-
-# ================= ENV =================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN not found in Railway Variables")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 DATA_FILE = "members.json"
 BACKUP_FILE = "members_backup.json"
-
-FOLDER_ID = "1sPQUdBZce1Os4oRPkDWFqsgzgkp95cha"
-
-LOGO = "https://cdn.discordapp.com/attachments/1468621028598087843/1481027347124719707/member.png"
 
 ROLE_PACKAGES = {
     "VIP": {"price": 200, "days": 30},
     "Supreme": {"price": 300, "days": 30}
 }
 
+GIF_THUMBNAIL = "https://cdn.discordapp.com/attachments/1468621028598087843/1471249375706746890/Black_White_Minimalist_Animation_Logo_Video_1.gif"
+
 intents = discord.Intents.default()
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================= JSON =================
+# ---------------- API QUEUE ----------------
+
+api_queue = asyncio.Queue()
+
+async def api_worker():
+    while True:
+        func, args, kwargs = await api_queue.get()
+        try:
+            await func(*args, **kwargs)
+        except Exception as e:
+            print("API ERROR:", e)
+
+        await asyncio.sleep(1)
+        api_queue.task_done()
+
+async def queue_api(func, *args, **kwargs):
+    await api_queue.put((func, args, kwargs))
+
+# ---------------- JSON SAFE ----------------
 
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {}
+        if os.path.exists(BACKUP_FILE):
+            shutil.copy(BACKUP_FILE, DATA_FILE)
+        else:
+            return {}
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {}
+        if os.path.exists(BACKUP_FILE):
+            shutil.copy(BACKUP_FILE, DATA_FILE)
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 def save_data(data):
-
-    tmp = "members.tmp"
-
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-    os.replace(tmp, DATA_FILE)
     shutil.copy(DATA_FILE, BACKUP_FILE)
 
-DATA = load_data()
-
-# ================= GOOGLE DRIVE =================
-
-def upload_to_drive(file_name):
-
-    try:
-
-        scope = ["https://www.googleapis.com/auth/drive"]
-
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            "drive_key.json", scope
-        )
-
-        drive = GoogleDrive(creds)
-
-        file_drive = drive.CreateFile({
-            "title": file_name,
-            "parents": [{"id": FOLDER_ID}]
-        })
-
-        file_drive.SetContentFile(file_name)
-        file_drive.Upload()
-
-        print("Uploaded to Google Drive:", file_name)
-
-    except Exception as e:
-        print("Drive upload error:", e)
-
-# ================= QUEUE =================
-
-queue = asyncio.Queue()
-
-@tasks.loop(seconds=1)
-async def queue_worker():
-
-    if queue.empty():
-        await asyncio.sleep(1)
-        return
-
-    task = await queue.get()
-
-    if task["type"] == "add_role":
-        try:
-            await task["member"].add_roles(task["role"])
-        except:
-            pass
-
-    if task["type"] == "remove_role":
-        try:
-            await task["member"].remove_roles(task["role"])
-        except:
-            pass
-
-# ================= TIME =================
+# ---------------- TIME ----------------
 
 def parse_date(text):
     return datetime.strptime(text, "%d/%m/%y").date()
@@ -120,21 +75,38 @@ def parse_date(text):
 def calc_expire(start):
     return start + timedelta(days=29)
 
-# ================= EMBED =================
+# ---------------- PACKAGE ----------------
+
+def get_package(role):
+    for key in ROLE_PACKAGES:
+        if role.name.startswith(key):
+            p = ROLE_PACKAGES[key]
+            return key, p["price"], p["days"]
+
+    return role.name, "-", "-"
+
+# ---------------- EMBED ----------------
 
 def build_embed(member, info):
 
     role = member.guild.get_role(info["role_id"])
 
+    package, price, days = get_package(role)
+
     start = date.fromisoformat(info["start_date"])
     expire = date.fromisoformat(info["expire_date"])
 
+    color = discord.Color.gold()
+
+    if package == "Supreme":
+        color = discord.Color.red()
+
     embed = discord.Embed(
         title="👑 สถานะสมาชิก",
-        color=discord.Color.gold()
+        color=color
     )
 
-    embed.set_thumbnail(url=LOGO)
+    embed.set_thumbnail(url=GIF_THUMBNAIL)
 
     embed.add_field(name="👤 ผู้รับ Role", value=member.mention, inline=False)
 
@@ -142,84 +114,75 @@ def build_embed(member, info):
 
     embed.add_field(name="📅 วันที่สมัคร", value=start.strftime("%d/%m/%Y"), inline=True)
 
+    embed.add_field(
+        name="💎 แพ็กเกจ",
+        value=f"{package} | ราคา {price} บาท | จำนวน {days} วัน",
+        inline=False
+    )
+
     embed.add_field(name="📅 วันหมดอายุ", value=expire.strftime("%d/%m/%Y"), inline=True)
 
-    embed.set_footer(text="Member System")
+    embed.set_footer(text="Zeno thanks for your support")
 
     return embed
 
-# ================= DM =================
+# ---------------- DM ----------------
 
 async def dm_user(member, text):
-    if not member:
-        return
     try:
-        await member.send(text)
+        await queue_api(member.send, text)
     except:
         pass
 
 async def dm_admin(text):
     admin = bot.get_user(ADMIN_ID)
+
     if admin:
         try:
-            await admin.send(text)
+            await queue_api(admin.send, text)
         except:
             pass
 
-# ================= BUTTON =================
+# ---------------- BUTTON ----------------
 
-class CancelView(discord.ui.View):
+class CancelRoleButton(discord.ui.View):
 
-    def __init__(self):
+    def __init__(self, member_id=None):
         super().__init__(timeout=None)
+        self.member_id = member_id
 
-    @discord.ui.button(label="❌ ยกเลิก Role", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="❌ ยกเลิก Role", style=discord.ButtonStyle.red, custom_id="cancel_member_role")
 
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def cancel_role(self, interaction: discord.Interaction, button: discord.ui.Button):
 
         if interaction.user.id != ADMIN_ID:
             await interaction.response.send_message("❌ admin only", ephemeral=True)
             return
 
-        message_id = interaction.message.id
+        data = load_data()
 
-        member_id = None
-        info = None
+        uid = self.member_id or interaction.message.embeds[0].fields[0].value.strip("<@>")
 
-        for uid, data in DATA.items():
-            if data.get("message_id") == message_id:
-                member_id = uid
-                info = data
-                break
-
-        if not member_id:
-            await interaction.response.send_message("❌ ไม่พบข้อมูล", ephemeral=True)
+        if str(uid) not in data:
+            await interaction.response.send_message("❌ ไม่มีข้อมูล", ephemeral=True)
             return
 
-        member = interaction.guild.get_member(int(member_id))
+        info = data[str(uid)]
+
+        member = interaction.guild.get_member(int(uid))
         role = interaction.guild.get_role(info["role_id"])
 
-        if not member or not role:
-            await interaction.response.send_message("❌ ไม่พบ member หรือ role")
-            return
+        if member and role:
+            await queue_api(member.remove_roles, role)
 
-        await queue.put({
-            "type": "remove_role",
-            "member": member,
-            "role": role
-        })
-
-        await dm_user(member, "⛔ Role สมาชิกของคุณถูกยกเลิกแล้ว")
-        await dm_admin(f"❌ ยกเลิก Role ของ {member}")
-
-        del DATA[member_id]
-        save_data(DATA)
+        del data[str(uid)]
+        save_data(data)
 
         await interaction.response.send_message("✅ ยกเลิก Role แล้ว")
 
-# ================= SET ROLE =================
+# ---------------- SET ROLE ----------------
 
-@bot.tree.command(name="setrole")
+@bot.tree.command(name="setrole", description="เพิ่มสมาชิก")
 
 async def setrole(interaction: discord.Interaction, member: discord.Member, role: discord.Role, start_date: str):
 
@@ -230,11 +193,7 @@ async def setrole(interaction: discord.Interaction, member: discord.Member, role
     start = parse_date(start_date)
     expire = calc_expire(start)
 
-    await queue.put({
-        "type": "add_role",
-        "member": member,
-        "role": role
-    })
+    await queue_api(member.add_roles, role)
 
     info = {
         "role_id": role.id,
@@ -245,21 +204,67 @@ async def setrole(interaction: discord.Interaction, member: discord.Member, role
 
     embed = build_embed(member, info)
 
-    await interaction.response.send_message(embed=embed, view=CancelView())
+    view = CancelRoleButton(member.id)
+
+    await interaction.response.send_message(embed=embed, view=view)
 
     msg = await interaction.original_response()
 
     info["channel_id"] = msg.channel.id
     info["message_id"] = msg.id
 
-    DATA[str(member.id)] = info
-    save_data(DATA)
+    data = load_data()
 
-# ================= EXPIRE CHECK =================
+    data[str(member.id)] = info
 
-@tasks.loop(minutes=10)
+    save_data(data)
+
+    package, price, days = get_package(role)
+
+    await dm_user(member,
+        f"👑 คุณได้รับ Role สมาชิก\n\n"
+        f"Member : {package}\n"
+        f"ราคา : {price} บาท\n"
+        f"จำนวน : {days} วัน"
+    )
+
+    await dm_admin(f"✅ เพิ่ม Role ให้ {member}")
+
+# ---------------- RENEW ----------------
+
+@bot.tree.command(name="renew", description="ต่ออายุสมาชิก")
+
+async def renew(interaction: discord.Interaction, member: discord.Member):
+
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("❌ admin only", ephemeral=True)
+        return
+
+    data = load_data()
+
+    if str(member.id) not in data:
+        await interaction.response.send_message("❌ ไม่มีสมาชิก", ephemeral=True)
+        return
+
+    info = data[str(member.id)]
+
+    expire = date.fromisoformat(info["expire_date"])
+
+    new_expire = expire + timedelta(days=30)
+
+    info["expire_date"] = new_expire.isoformat()
+
+    save_data(data)
+
+    await interaction.response.send_message("✅ ต่ออายุแล้ว")
+
+# ---------------- AUTO CHECK ----------------
+
+@tasks.loop(minutes=30)
 
 async def check_expire():
+
+    data = load_data()
 
     now = datetime.now(timezone.utc)
 
@@ -270,7 +275,7 @@ async def check_expire():
 
     changed = False
 
-    for uid, info in list(DATA.items()):
+    for uid, info in list(data.items()):
 
         member = guild.get_member(int(uid))
         role = guild.get_role(info["role_id"])
@@ -279,82 +284,48 @@ async def check_expire():
             continue
 
         expire = date.fromisoformat(info["expire_date"])
+
         expire_dt = datetime.combine(expire, datetime.max.time(), tzinfo=timezone.utc)
 
         remain = expire_dt - now
 
-        if remain.days == 3 and not info["warned"]:
+        if remain.days <= 3 and not info["warned"]:
 
             await dm_user(member, "⚠ สมาชิกจะหมดอายุในอีก 3 วัน")
+
+            await dm_admin(f"⚠ {member} จะหมดอายุใน 3 วัน")
+
             info["warned"] = True
+
             changed = True
 
         if now >= expire_dt:
 
-            await queue.put({
-                "type": "remove_role",
-                "member": member,
-                "role": role
-            })
+            await queue_api(member.remove_roles, role)
 
             await dm_user(member, "⛔ สมาชิกของคุณหมดอายุแล้ว")
 
-            del DATA[uid]
+            await dm_admin(f"⛔ หมดอายุ {member}")
+
+            del data[uid]
+
             changed = True
 
     if changed:
-        save_data(DATA)
+        save_data(data)
 
-# ================= BACKUP =================
-
-@tasks.loop(hours=6)
-
-async def auto_backup():
-
-    if not os.path.exists(DATA_FILE):
-        return
-
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M")
-
-    name = f"backup_members_{now}.json"
-
-    shutil.copy(DATA_FILE, name)
-
-    upload_to_drive(name)
-
-    print("Backup created:", name)
-
-# ================= CLEAN BACKUP =================
-
-@tasks.loop(hours=12)
-
-async def clean_backup():
-
-    files = sorted(glob.glob("backup_members_*.json"))
-
-    if len(files) <= 10:
-        return
-
-    old = files[:-10]
-
-    for f in old:
-        os.remove(f)
-
-    print("Old backups cleaned")
-
-# ================= READY =================
+# ---------------- READY ----------------
 
 @bot.event
 async def on_ready():
 
     await bot.tree.sync()
 
-    bot.add_view(CancelView())
+    bot.loop.create_task(api_worker())
 
-    queue_worker.start()
+    bot.add_view(CancelRoleButton())
+
     check_expire.start()
-    auto_backup.start()
-    clean_backup.start()
 
     print("BOT ONLINE")
 
