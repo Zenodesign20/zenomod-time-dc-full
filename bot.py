@@ -7,6 +7,16 @@ import os
 import shutil
 import asyncio
 
+# ===== (ADD) Google Drive libs (optional) =====
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GDRIVE_AVAILABLE = True
+except:
+    GDRIVE_AVAILABLE = False
+# ==============================================
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
@@ -126,6 +136,20 @@ def build_embed(member, info):
 
     return embed
 
+
+# ===== (ADD) EMBED เมื่อหมดอายุ =====
+def build_expired_embed(member, info):
+    embed = discord.Embed(
+        title="👑 สถานะสมาชิก",
+        description=f"สมาชิก: {member.mention}\n\nสถานะ: Member หมดอายุ\nหมายเหตุ: ติดต่อสมัครสมาชิกที่ห้องติดต่อ",
+        color=discord.Color.dark_grey()
+    )
+    embed.set_thumbnail(url=GIF_THUMBNAIL)
+    embed.set_footer(text="Zeno thanks for your support")
+    return embed
+# ====================================
+
+
 # ---------------- DM ----------------
 
 async def dm_user(member, text):
@@ -177,6 +201,12 @@ class CancelRoleButton(discord.ui.View):
 
         del data[str(uid)]
         save_data(data)
+
+        # ===== (ADD) แจ้งเตือนตอนยกเลิก =====
+        if member:
+            await dm_user(member, "❌ Role ของคุณถูกยกเลิกแล้ว")
+        await dm_admin(f"❌ ยกเลิก Role ของ {member}")
+        # ====================================
 
         await interaction.response.send_message("✅ ยกเลิก Role แล้ว")
 
@@ -230,33 +260,6 @@ async def setrole(interaction: discord.Interaction, member: discord.Member, role
 
     await dm_admin(f"✅ เพิ่ม Role ให้ {member}")
 
-# ---------------- RENEW ----------------
-
-@bot.tree.command(name="renew", description="ต่ออายุสมาชิก")
-
-async def renew(interaction: discord.Interaction, member: discord.Member):
-
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ admin only", ephemeral=True)
-        return
-
-    data = load_data()
-
-    if str(member.id) not in data:
-        await interaction.response.send_message("❌ ไม่มีสมาชิก", ephemeral=True)
-        return
-
-    info = data[str(member.id)]
-
-    expire = date.fromisoformat(info["expire_date"])
-
-    new_expire = expire + timedelta(days=30)
-
-    info["expire_date"] = new_expire.isoformat()
-
-    save_data(data)
-
-    await interaction.response.send_message("✅ ต่ออายุแล้ว")
 
 # ---------------- AUTO CHECK ----------------
 
@@ -307,12 +310,94 @@ async def check_expire():
 
             await dm_admin(f"⛔ หมดอายุ {member}")
 
+            # ===== (ADD) เปลี่ยน embed เมื่อหมดอายุ =====
+            try:
+                channel = bot.get_channel(info["channel_id"])
+                msg = await channel.fetch_message(info["message_id"])
+                embed = build_expired_embed(member, info)
+                await queue_api(msg.edit, embed=embed, view=None)
+            except:
+                pass
+            # ============================================
+
             del data[uid]
 
             changed = True
 
     if changed:
         save_data(data)
+
+
+# ===== (ADD) Sync Embed & Button หลัง restart =====
+async def rebuild_embeds():
+
+    await bot.wait_until_ready()
+
+    data = load_data()
+
+    if not bot.guilds:
+        return
+
+    guild = bot.guilds[0]
+
+    for uid, info in data.items():
+
+        try:
+            channel = bot.get_channel(info["channel_id"])
+            msg = await channel.fetch_message(info["message_id"])
+
+            member = guild.get_member(int(uid))
+
+            if not member:
+                continue
+
+            expire = date.fromisoformat(info["expire_date"])
+            today = datetime.utcnow().date()
+
+            if today > expire:
+                embed = build_expired_embed(member, info)
+                await msg.edit(embed=embed, view=None)
+            else:
+                embed = build_embed(member, info)
+                view = CancelRoleButton(int(uid))
+                await msg.edit(embed=embed, view=view)
+
+        except Exception as e:
+            print("REBUILD ERROR", e)
+# ===================================================
+
+
+# ===== (ADD) Google Drive Backup ทุก 4 ชม =====
+@tasks.loop(hours=4)
+async def gdrive_backup():
+
+    if not GDRIVE_AVAILABLE:
+        return
+
+    if not os.path.exists(DATA_FILE):
+        return
+
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            "service_account.json",
+            scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+
+        service = build("drive", "v3", credentials=creds)
+
+        media = MediaFileUpload(DATA_FILE, mimetype="application/json")
+
+        service.files().create(
+            body={"name": f"members_backup_{int(datetime.utcnow().timestamp())}.json"},
+            media_body=media
+        ).execute()
+
+        print("GDRIVE BACKUP DONE")
+
+    except Exception as e:
+        print("GDRIVE ERROR", e)
+# =================================================
+
 
 # ---------------- READY ----------------
 
@@ -326,6 +411,12 @@ async def on_ready():
     bot.add_view(CancelRoleButton())
 
     check_expire.start()
+
+    # ===== (ADD) ระบบเสริม =====
+    bot.loop.create_task(rebuild_embeds())
+    if GDRIVE_AVAILABLE:
+        gdrive_backup.start()
+    # ============================
 
     print("BOT ONLINE")
 
